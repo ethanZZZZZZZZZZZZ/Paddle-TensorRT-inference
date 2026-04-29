@@ -22,6 +22,8 @@ public:
     struct Request {
         int batch_id = 0;
         TensorBuffer input;
+        DeviceTensorView device_input;
+        bool has_device_input = false;
         bool prefer_device_output = false;
     };
 

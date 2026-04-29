@@ -249,6 +249,8 @@ Config Config::LoadFromFile(const std::string& path) {
         ParseInt(values, "cuda.stream_pool_size", config.cuda.stream_pool_size);
     config.cuda.enable_pinned_memory =
         ParseBool(values, "cuda.enable_pinned_memory", config.cuda.enable_pinned_memory);
+    config.cuda.enable_full_gpu_pipeline =
+        ParseBool(values, "cuda.enable_full_gpu_pipeline", config.cuda.enable_full_gpu_pipeline);
 
     config.paddle.model_file = ResolvePathRelativeToConfig(
         path,
@@ -316,6 +318,8 @@ Config Config::LoadFromFile(const std::string& path) {
     config.postprocess.nms_threshold =
         ParseFloat(values, "postprocess.nms_threshold", config.postprocess.nms_threshold);
     config.postprocess.top_k = ParseInt(values, "postprocess.top_k", config.postprocess.top_k);
+    config.postprocess.plugin_int8_input_scale =
+        ParseFloat(values, "postprocess.plugin_int8_input_scale", config.postprocess.plugin_int8_input_scale);
 
     config.profile.enable_timer = ParseBool(values, "profile.enable_timer", config.profile.enable_timer);
 
@@ -410,6 +414,26 @@ Config Config::LoadFromFile(const std::string& path) {
             "configuring with -DENABLE_CUDA=ON or -DENABLE_TENSORRT_PLUGIN=ON.");
     }
 #endif
+#ifndef EDGE_ENABLE_CUDA
+    if (config.cuda.enable_full_gpu_pipeline) {
+        throw std::runtime_error(
+            "cuda.enable_full_gpu_pipeline=true requires configuring with -DENABLE_CUDA=ON.");
+    }
+#endif
+#if defined(EDGE_ENABLE_CUDA) && !defined(EDGE_ENABLE_PADDLE)
+    if (config.cuda.enable_full_gpu_pipeline) {
+        throw std::runtime_error(
+            "cuda.enable_full_gpu_pipeline=true currently requires infer.backend=paddle/paddle_trt "
+            "and configuring with -DENABLE_PADDLE=ON.");
+    }
+#endif
+#if defined(EDGE_ENABLE_CUDA) && defined(EDGE_ENABLE_PADDLE) && !defined(EDGE_ENABLE_PADDLE_GPU_INPUT_SHARE)
+    if (config.cuda.enable_full_gpu_pipeline) {
+        throw std::runtime_error(
+            "cuda.enable_full_gpu_pipeline=true requires Paddle GPU input ShareExternalData support. "
+            "Reconfigure with -DENABLE_PADDLE_GPU_INPUT_SHARE=ON, or keep enable_full_gpu_pipeline=false.");
+    }
+#endif
     if (config.infer.backend == "paddle" || config.infer.backend == "paddle_trt") {
         const bool has_model_dir = !config.paddle.model_dir.empty();
         const bool has_model_pair = !config.paddle.model_file.empty() && !config.paddle.params_file.empty();
@@ -435,6 +459,20 @@ Config Config::LoadFromFile(const std::string& path) {
         }
         if (config.paddle.gpu_device_id < 0) {
             throw std::runtime_error("paddle.gpu_device_id must be >= 0");
+        }
+    }
+    if (config.cuda.enable_full_gpu_pipeline) {
+        if (config.preprocess.type != "gpu") {
+            throw std::runtime_error(
+                "cuda.enable_full_gpu_pipeline=true requires preprocess.type: gpu");
+        }
+        if (config.infer.backend != "paddle" && config.infer.backend != "paddle_trt") {
+            throw std::runtime_error(
+                "cuda.enable_full_gpu_pipeline=true requires infer.backend: paddle or paddle_trt");
+        }
+        if (!config.paddle.use_gpu) {
+            throw std::runtime_error(
+                "cuda.enable_full_gpu_pipeline=true requires paddle.use_gpu: true");
         }
     }
     if (config.infer.backend == "paddle_trt" && !config.trt.enable) {
@@ -563,6 +601,14 @@ Config Config::LoadFromFile(const std::string& path) {
         config.postprocess.nms_backend != "trt_plugin") {
         throw std::runtime_error("postprocess.decode_backend=trt_plugin requires postprocess.nms_backend=trt_plugin");
     }
+    if (config.cuda.enable_full_gpu_pipeline &&
+        (config.postprocess.decode_backend != "trt_plugin" ||
+         config.postprocess.nms_backend != "trt_plugin")) {
+        throw std::runtime_error(
+            "cuda.enable_full_gpu_pipeline=true currently requires "
+            "postprocess.decode_backend=trt_plugin and postprocess.nms_backend=trt_plugin "
+            "so Paddle GPU output can stay on device through postprocess.");
+    }
 #ifndef EDGE_ENABLE_CUDA
     if (config.postprocess.decode_backend == "gpu" || config.postprocess.nms_backend == "gpu") {
         throw std::runtime_error(
@@ -586,6 +632,9 @@ Config Config::LoadFromFile(const std::string& path) {
     }
     if (config.postprocess.top_k <= 0) {
         throw std::runtime_error("postprocess.top_k must be positive");
+    }
+    if (config.postprocess.plugin_int8_input_scale <= 0.0F) {
+        throw std::runtime_error("postprocess.plugin_int8_input_scale must be positive");
     }
     if (config.benchmark.warmup_iters < 0) {
         throw std::runtime_error("benchmark.warmup_iters must be >= 0");
@@ -634,6 +683,8 @@ void Config::Print(std::ostream& os) const {
     os << "[cuda]\n";
     os << "stream_pool_size: " << data_.cuda.stream_pool_size << '\n';
     os << "enable_pinned_memory: " << (data_.cuda.enable_pinned_memory ? "true" : "false") << '\n';
+    os << "enable_full_gpu_pipeline: "
+       << (data_.cuda.enable_full_gpu_pipeline ? "true" : "false") << '\n';
 
     os << "[paddle]\n";
     os << "model_file: " << data_.paddle.model_file << '\n';
@@ -678,6 +729,7 @@ void Config::Print(std::ostream& os) const {
     os << "score_threshold: " << data_.postprocess.score_threshold << '\n';
     os << "nms_threshold: " << data_.postprocess.nms_threshold << '\n';
     os << "top_k: " << data_.postprocess.top_k << '\n';
+    os << "plugin_int8_input_scale: " << data_.postprocess.plugin_int8_input_scale << '\n';
 
     os << "[profile]\n";
     os << "enable_timer: " << (data_.profile.enable_timer ? "true" : "false") << '\n';

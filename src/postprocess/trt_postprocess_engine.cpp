@@ -68,6 +68,48 @@ std::size_t CountElements(const std::vector<int64_t>& shape) {
     return count;
 }
 
+std::size_t ElementBytes(TensorDataType dtype) {
+    switch (dtype) {
+        case TensorDataType::kFloat32:
+            return sizeof(float);
+        case TensorDataType::kFloat16:
+            return 2;
+        case TensorDataType::kInt8:
+            return 1;
+        case TensorDataType::kInt32:
+            return sizeof(int);
+        default:
+            return 0;
+    }
+}
+
+nvinfer1::DataType ToTrtDataType(TensorDataType dtype) {
+    switch (dtype) {
+        case TensorDataType::kFloat16:
+            return nvinfer1::DataType::kHALF;
+        case TensorDataType::kInt8:
+            return nvinfer1::DataType::kINT8;
+        case TensorDataType::kFloat32:
+        default:
+            return nvinfer1::DataType::kFLOAT;
+    }
+}
+
+std::string DTypeName(TensorDataType dtype) {
+    switch (dtype) {
+        case TensorDataType::kFloat32:
+            return "fp32";
+        case TensorDataType::kFloat16:
+            return "fp16";
+        case TensorDataType::kInt8:
+            return "int8";
+        case TensorDataType::kInt32:
+            return "int32";
+        default:
+            return "unknown";
+    }
+}
+
 nvinfer1::Dims MakeDims(const std::vector<int64_t>& shape) {
     nvinfer1::Dims dims{};
     dims.nbDims = static_cast<int>(shape.size());
@@ -133,12 +175,14 @@ bool TrtPostprocessEngine::Run(
         return false;
     }
 
-    if (!IsBuiltForShape(model_output.shape) && !BuildForShape(model_output.shape)) {
+    constexpr TensorDataType model_dtype = TensorDataType::kFloat32;
+    if (!IsBuiltForShape(model_output.shape, model_dtype) &&
+        !BuildForShape(model_output.shape, model_dtype)) {
         return false;
     }
 
     std::vector<float> host_meta;
-    float* device_model_output = nullptr;
+    void* device_model_output = nullptr;
     float* device_meta = nullptr;
     float* device_detections = nullptr;
     int* device_counts = nullptr;
@@ -151,6 +195,7 @@ bool TrtPostprocessEngine::Run(
     };
 
     if (!AllocateDeviceBuffers(model_output.shape,
+                               model_dtype,
                                batch,
                                preprocess_metas,
                                true,
@@ -238,8 +283,15 @@ bool TrtPostprocessEngine::RunDevice(
     detections.clear();
     const auto start = std::chrono::steady_clock::now();
 
-    if (!model_output.IsGpuFloat()) {
-        EDGE_LOG_ERROR("TrtPostprocessEngine RunDevice requires a GPU FP32 model output view");
+    if (!model_output.IsGpu()) {
+        EDGE_LOG_ERROR("TrtPostprocessEngine RunDevice requires a GPU model output view");
+        return false;
+    }
+    if (model_output.dtype != TensorDataType::kFloat32 &&
+        model_output.dtype != TensorDataType::kFloat16 &&
+        model_output.dtype != TensorDataType::kInt8) {
+        EDGE_LOG_ERROR("TrtPostprocessEngine RunDevice unsupported model output dtype="
+                       << DTypeName(model_output.dtype));
         return false;
     }
     if (model_output.shape.size() != 3) {
@@ -263,12 +315,13 @@ bool TrtPostprocessEngine::RunDevice(
         return false;
     }
 
-    if (!IsBuiltForShape(model_output.shape) && !BuildForShape(model_output.shape)) {
+    if (!IsBuiltForShape(model_output.shape, model_output.dtype) &&
+        !BuildForShape(model_output.shape, model_output.dtype)) {
         return false;
     }
 
     std::vector<float> host_meta;
-    float* unused_device_model_output = nullptr;
+    void* unused_device_model_output = nullptr;
     float* device_meta = nullptr;
     float* device_detections = nullptr;
     int* device_counts = nullptr;
@@ -280,6 +333,7 @@ bool TrtPostprocessEngine::RunDevice(
     };
 
     if (!AllocateDeviceBuffers(model_output.shape,
+                               model_output.dtype,
                                batch,
                                preprocess_metas,
                                false,
@@ -343,6 +397,7 @@ bool TrtPostprocessEngine::RunDevice(
                   << ", nms_backend=trt_plugin"
                   << ", zero_copy_model_output=true"
                   << ", producer=" << model_output.producer
+                  << ", model_dtype=" << DTypeName(model_output.dtype)
                   << ", pinned_host=" << (use_pinned_memory_ ? "true" : "false")
                   << ", trt_plugin_ms=" << elapsed_ms
                   << ", detection_count=" << detections.size());
@@ -353,9 +408,12 @@ std::string TrtPostprocessEngine::Name() const {
     return "TrtPostprocessEngine";
 }
 
-bool TrtPostprocessEngine::BuildForShape(const std::vector<int64_t>& model_shape) {
+bool TrtPostprocessEngine::BuildForShape(
+    const std::vector<int64_t>& model_shape,
+    TensorDataType model_dtype) {
     EDGE_LOG_INFO("Building TensorRT postprocess plugin engine for model_output_shape="
-                  << ShapeKey(model_shape));
+                  << ShapeKey(model_shape)
+                  << ", model_dtype=" << DTypeName(model_dtype));
 
     initLibNvInferPlugins(&Logger(), "");
 
@@ -372,10 +430,15 @@ bool TrtPostprocessEngine::BuildForShape(const std::vector<int64_t>& model_shape
         EDGE_LOG_ERROR("Failed to create TensorRT network/config for postprocess plugin");
         return false;
     }
+    if (model_dtype == TensorDataType::kFloat16) {
+        builder_config->setFlag(nvinfer1::BuilderFlag::kFP16);
+    } else if (model_dtype == TensorDataType::kInt8) {
+        builder_config->setFlag(nvinfer1::BuilderFlag::kINT8);
+    }
 
     auto* model_input = network->addInput(
         kModelInputName,
-        nvinfer1::DataType::kFLOAT,
+        ToTrtDataType(model_dtype),
         MakeDims(model_shape));
     auto* meta_input = network->addInput(
         kMetaInputName,
@@ -385,13 +448,23 @@ bool TrtPostprocessEngine::BuildForShape(const std::vector<int64_t>& model_shape
         EDGE_LOG_ERROR("Failed to add TensorRT postprocess plugin inputs");
         return false;
     }
+    if (model_dtype == TensorDataType::kInt8) {
+        const float scale = config_.plugin_int8_input_scale > 0.0F
+                                ? config_.plugin_int8_input_scale
+                                : 1.0F;
+        if (!model_input->setDynamicRange(-127.0F * scale, 127.0F * scale)) {
+            EDGE_LOG_ERROR("Failed to set INT8 dynamic range for TensorRT postprocess plugin input");
+            return false;
+        }
+    }
 
     YoloDecodePlugin plugin(
         config_.score_threshold,
         config_.nms_threshold,
         config_.top_k,
         input_width_,
-        input_height_);
+        input_height_,
+        config_.plugin_int8_input_scale);
     nvinfer1::ITensor* plugin_inputs[] = {model_input, meta_input};
     auto* plugin_layer = network->addPluginV2(plugin_inputs, 2, plugin);
     if (plugin_layer == nullptr || plugin_layer->getNbOutputs() != 2) {
@@ -426,21 +499,29 @@ bool TrtPostprocessEngine::BuildForShape(const std::vector<int64_t>& model_shape
     }
 
     built_model_shape_ = model_shape;
-    EDGE_LOG_INFO("TensorRT postprocess plugin engine built successfully");
+    built_model_dtype_ = model_dtype;
+    EDGE_LOG_INFO("TensorRT postprocess plugin engine built successfully"
+                  << ", model_dtype=" << DTypeName(model_dtype));
     return true;
 }
 
-bool TrtPostprocessEngine::IsBuiltForShape(const std::vector<int64_t>& model_shape) const {
-    return engine_ != nullptr && context_ != nullptr && built_model_shape_ == model_shape;
+bool TrtPostprocessEngine::IsBuiltForShape(
+    const std::vector<int64_t>& model_shape,
+    TensorDataType model_dtype) const {
+    return engine_ != nullptr &&
+           context_ != nullptr &&
+           built_model_shape_ == model_shape &&
+           built_model_dtype_ == model_dtype;
 }
 
 bool TrtPostprocessEngine::AllocateDeviceBuffers(
     const std::vector<int64_t>& model_shape,
+    TensorDataType model_dtype,
     int batch,
     const std::vector<PreprocessMeta>& preprocess_metas,
     bool allocate_model_output,
     std::vector<float>* host_meta,
-    float** device_model_output,
+    void** device_model_output,
     float** device_meta,
     float** device_detections,
     int** device_counts) const {
@@ -469,7 +550,12 @@ bool TrtPostprocessEngine::AllocateDeviceBuffers(
         (*host_meta)[base + 5] = static_cast<float>(meta.pad_x);
         (*host_meta)[base + 6] = static_cast<float>(meta.pad_y);
     }
-    const std::size_t model_bytes = CountElements(model_shape) * sizeof(float);
+    const std::size_t model_element_bytes = ElementBytes(model_dtype);
+    if (model_element_bytes == 0) {
+        EDGE_LOG_ERROR("Unsupported TensorRT plugin model dtype=" << DTypeName(model_dtype));
+        return false;
+    }
+    const std::size_t model_bytes = CountElements(model_shape) * model_element_bytes;
     const std::size_t meta_bytes = host_meta->size() * sizeof(float);
     const std::size_t detection_bytes =
         static_cast<std::size_t>(batch) *
@@ -499,7 +585,7 @@ bool TrtPostprocessEngine::EnqueueAndCopy(
     int batch,
     const std::vector<FrameMeta>& frame_metas,
     cudaStream_t stream,
-    const float* device_model_output,
+    const void* device_model_output,
     float* device_meta,
     float* device_detections,
     int* device_counts,
@@ -515,7 +601,7 @@ bool TrtPostprocessEngine::EnqueueAndCopy(
     bool enqueue_ok = false;
 #if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 10
     enqueue_ok =
-        context_->setTensorAddress(kModelInputName, const_cast<float*>(device_model_output)) &&
+        context_->setTensorAddress(kModelInputName, const_cast<void*>(device_model_output)) &&
         context_->setTensorAddress(kMetaInputName, device_meta) &&
         context_->setTensorAddress(kDetectionsOutputName, device_detections) &&
         context_->setTensorAddress(kCountsOutputName, device_counts) &&
@@ -530,7 +616,7 @@ bool TrtPostprocessEngine::EnqueueAndCopy(
         EDGE_LOG_ERROR("TrtPostprocessEngine failed to resolve TensorRT binding indices");
         return false;
     }
-    bindings[model_index] = const_cast<float*>(device_model_output);
+    bindings[model_index] = const_cast<void*>(device_model_output);
     bindings[meta_index] = device_meta;
     bindings[detections_index] = device_detections;
     bindings[counts_index] = device_counts;

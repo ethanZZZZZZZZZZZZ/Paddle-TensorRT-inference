@@ -11,7 +11,13 @@ namespace edge {
 
 class YoloDecodePlugin final : public nvinfer1::IPluginV2DynamicExt {
 public:
-    YoloDecodePlugin(float score_threshold, float nms_threshold, int top_k, int input_width, int input_height);
+    YoloDecodePlugin(
+        float score_threshold,
+        float nms_threshold,
+        int top_k,
+        int input_width,
+        int input_height,
+        float int8_input_scale = 1.0F);
     YoloDecodePlugin(const void* data, std::size_t length);
 
     const char* getPluginType() const noexcept override;
@@ -76,6 +82,7 @@ private:
     int top_k_ = 100;
     int input_width_ = 640;
     int input_height_ = 640;
+    float int8_input_scale_ = 1.0F;
     std::string namespace_;
 };
 

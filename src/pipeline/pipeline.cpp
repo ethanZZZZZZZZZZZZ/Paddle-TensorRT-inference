@@ -32,6 +32,30 @@ double ElapsedMs(
     return static_cast<double>(us) / 1000.0;
 }
 
+bool UseTrtPluginPostprocess(const AppConfig& config) {
+    return config.postprocess.decode_backend == "trt_plugin" && config.postprocess.mode != "raw";
+}
+
+bool UseFullGpuPipeline(const AppConfig& config) {
+    return config.cuda.enable_full_gpu_pipeline &&
+           config.preprocess.type == "gpu" &&
+           (config.infer.backend == "paddle" || config.infer.backend == "paddle_trt");
+}
+
+#ifdef EDGE_ENABLE_CUDA
+DeviceTensorView MakeGpuInputView(const GpuTensorBuffer& tensor, const std::string& producer) {
+    DeviceTensorView view;
+    view.data = tensor.Data();
+    view.shape = tensor.Shape();
+    view.num_elements = tensor.Elements();
+    view.element_bytes = sizeof(float);
+    view.place = TensorMemoryPlace::kGPU;
+    view.dtype = TensorDataType::kFloat32;
+    view.producer = producer;
+    return view;
+}
+#endif
+
 }  // namespace
 
 Pipeline::Pipeline(const Config& config)
@@ -118,6 +142,7 @@ bool Pipeline::Init() {
     const bool needs_cuda_stream_pool =
 #ifdef EDGE_ENABLE_CUDA
         config_.preprocess.type == "gpu" || config_.postprocess.decode_backend == "gpu" ||
+        config_.cuda.enable_full_gpu_pipeline ||
 #else
         false ||
 #endif
@@ -183,6 +208,8 @@ bool Pipeline::Init() {
     EDGE_LOG_INFO("  cuda.stream_pool_size=" << config_.cuda.stream_pool_size);
     EDGE_LOG_INFO("  cuda.enable_pinned_memory="
                   << (config_.cuda.enable_pinned_memory ? "true" : "false"));
+    EDGE_LOG_INFO("  cuda.enable_full_gpu_pipeline="
+                  << (config_.cuda.enable_full_gpu_pipeline ? "true" : "false"));
     EDGE_LOG_INFO("  profile.enable_timer=" << (config_.profile.enable_timer ? "true" : "false"));
     EDGE_LOG_INFO("  output.save_result=" << (config_.output.save_result ? "true" : "false"));
     EDGE_LOG_INFO("  benchmark.warmup_iters=" << config_.benchmark.warmup_iters);
@@ -382,6 +409,11 @@ bool Pipeline::ProcessBatch(
                                                          << mapping.str());
 
     TensorBuffer input_tensor;
+#ifdef EDGE_ENABLE_CUDA
+    GpuTensorBuffer gpu_input_tensor;
+    DeviceTensorView device_input_tensor;
+    bool has_device_input_tensor = false;
+#endif
     std::vector<PreprocessMeta> preprocess_metas;
     Timer stage_timer;
     Timer process_timer;
@@ -419,17 +451,22 @@ bool Pipeline::ProcessBatch(
                     return false;
                 }
 
-                GpuTensorBuffer gpu_tensor;
                 {
                     PROFILE_RANGE("gpu_preprocess");
                     if (!gpu_preprocessor_->RunBatch(
-                            batch.frames, stream_lease.Get(), gpu_tensor, preprocess_metas, &gpu_preprocess_ms)) {
+                            batch.frames, stream_lease.Get(), gpu_input_tensor, preprocess_metas, &gpu_preprocess_ms)) {
                         return false;
                     }
                 }
-                {
+                if (UseFullGpuPipeline(config_)) {
+                    device_input_tensor = MakeGpuInputView(gpu_input_tensor, "GpuPreprocessor");
+                    has_device_input_tensor = true;
+                    d2h_copy_ms = 0.0;
+                    EDGE_LOG_INFO("[Preprocess] full_gpu_pipeline=true, skip preprocess D2H copy"
+                                  << ", input_shape=" << ShapeToString(device_input_tensor.shape));
+                } else {
                     PROFILE_RANGE("d2h_copy");
-                    if (!gpu_preprocessor_->CopyToHost(gpu_tensor,
+                    if (!gpu_preprocessor_->CopyToHost(gpu_input_tensor,
                                                        stream_lease.Get(),
                                                        input_tensor,
                                                        &d2h_copy_ms,
@@ -458,12 +495,18 @@ bool Pipeline::ProcessBatch(
 
         TensorBuffer model_output;
         InferOutput infer_output;
-        const bool use_trt_plugin_postprocess =
-            config_.postprocess.decode_backend == "trt_plugin" && config_.postprocess.mode != "raw";
+        const bool use_trt_plugin_postprocess = UseTrtPluginPostprocess(config_);
         stage_timer.Tic();
         {
             PROFILE_RANGE("inference");
-            const bool infer_ok = use_trt_plugin_postprocess
+#ifdef EDGE_ENABLE_CUDA
+            const bool infer_ok = has_device_input_tensor
+                                      ? infer_engine_->Infer(device_input_tensor, infer_output)
+                                      :
+#else
+            const bool infer_ok =
+#endif
+                                  use_trt_plugin_postprocess
                                       ? infer_engine_->Infer(input_tensor, infer_output)
                                       : infer_engine_->Infer(input_tensor, model_output);
             if (!infer_ok) {
@@ -472,13 +515,21 @@ bool Pipeline::ProcessBatch(
                                                                       << infer_engine_->Name());
                 return false;
             }
-            if (use_trt_plugin_postprocess && infer_output.has_host_tensor) {
+            if ((use_trt_plugin_postprocess
+#ifdef EDGE_ENABLE_CUDA
+                 || has_device_input_tensor
+#endif
+                 ) && infer_output.has_host_tensor) {
                 model_output = std::move(infer_output.host_tensor);
             }
         }
         inference_ms = stage_timer.TocMs();
         const std::vector<int64_t>& output_shape =
-            (use_trt_plugin_postprocess && infer_output.has_device_tensor)
+            ((use_trt_plugin_postprocess
+#ifdef EDGE_ENABLE_CUDA
+              || has_device_input_tensor
+#endif
+              ) && infer_output.has_device_tensor)
                 ? infer_output.device_tensor.shape
                 : model_output.shape;
         EDGE_LOG_INFO("Stage inference done batch_id=" << batch.batch_id
@@ -486,8 +537,18 @@ bool Pipeline::ProcessBatch(
                                                        << batch.ActualBatchSize()
                                                        << ", output_shape="
                                                        << ShapeToString(output_shape)
+                                                       << ", device_input="
+#ifdef EDGE_ENABLE_CUDA
+                                                       << (has_device_input_tensor ? "true" : "false")
+#else
+                                                       << "false"
+#endif
                                                        << ", device_output="
-                                                       << (use_trt_plugin_postprocess &&
+                                                       << ((use_trt_plugin_postprocess
+#ifdef EDGE_ENABLE_CUDA
+                                                            || has_device_input_tensor
+#endif
+                                                            ) &&
                                                            infer_output.has_device_tensor
                                                                ? "true"
                                                                : "false"));
@@ -509,7 +570,7 @@ bool Pipeline::ProcessBatch(
                 return false;
             }
             bool postprocess_ok = false;
-            if (infer_output.has_device_tensor && infer_output.device_tensor.IsGpuFloat()) {
+            if (infer_output.has_device_tensor && infer_output.device_tensor.IsGpu()) {
                 postprocess_ok = trt_postprocess_engine_->RunDevice(infer_output.device_tensor,
                                                                     frame_metas,
                                                                     preprocess_metas,
@@ -536,6 +597,11 @@ bool Pipeline::ProcessBatch(
 #endif
 #ifdef EDGE_ENABLE_CUDA
         if (config_.postprocess.decode_backend == "gpu" && config_.postprocess.mode != "raw") {
+            if (model_output.NumElements() == 0) {
+                EDGE_LOG_ERROR("GPU decode path requires a host model output tensor. "
+                               << "For full GPU pipeline use postprocess.decode_backend=trt_plugin.");
+                return false;
+            }
             PROFILE_RANGE("postprocess");
             Timer postprocess_total_timer;
             postprocess_total_timer.Tic();
@@ -605,6 +671,11 @@ bool Pipeline::ProcessBatch(
         } else
 #endif
         {
+            if (model_output.NumElements() == 0) {
+                EDGE_LOG_ERROR("CPU postprocess path requires a host model output tensor. "
+                               << "For full GPU pipeline use postprocess.decode_backend=trt_plugin.");
+                return false;
+            }
             if (!postprocessor_.Run(model_output,
                                     frame_metas,
                                     preprocess_metas,
@@ -769,8 +840,7 @@ bool Pipeline::RunWithPredictorPool() {
     int outstanding = 0;
     std::map<int, PreparedBatch> prepared_batches;
 
-    const bool use_trt_plugin_postprocess =
-        config_.postprocess.decode_backend == "trt_plugin" && config_.postprocess.mode != "raw";
+    const bool use_trt_plugin_postprocess = UseTrtPluginPostprocess(config_);
 
     auto finalize_one_result = [&]() -> bool {
         PredictorPool::Result result;
@@ -854,7 +924,17 @@ bool Pipeline::RunWithPredictorPool() {
         PredictorPool::Request request;
         request.batch_id = prepared.batch.batch_id;
         request.prefer_device_output = use_trt_plugin_postprocess;
+#ifdef EDGE_ENABLE_CUDA
+        if (prepared.has_device_input_tensor) {
+            request.device_input = prepared.device_input_tensor;
+            request.has_device_input = true;
+            request.prefer_device_output = true;
+        } else {
+            request.input = std::move(prepared.input_tensor);
+        }
+#else
         request.input = std::move(prepared.input_tensor);
+#endif
         prepared_batches[prepared.batch.batch_id] = std::move(prepared);
         if (!predictor_pool_->Submit(std::move(request))) {
             prepared_batches.erase(batch.batch_id);
@@ -1011,18 +1091,29 @@ bool Pipeline::PreprocessBatch(const FrameBatch& batch, Pipeline::PreparedBatch&
                 return false;
             }
 
-            GpuTensorBuffer gpu_tensor;
             {
                 PROFILE_RANGE("gpu_preprocess");
                 if (!gpu_preprocessor_->RunBatch(
-                        batch.frames, stream.Get(), gpu_tensor, prepared.preprocess_metas, &prepared.gpu_preprocess_ms)) {
+                        batch.frames,
+                        stream.Get(),
+                        prepared.gpu_input_tensor,
+                        prepared.preprocess_metas,
+                        &prepared.gpu_preprocess_ms)) {
                     return false;
                 }
             }
-            {
+            if (UseFullGpuPipeline(config_)) {
+                prepared.device_input_tensor =
+                    MakeGpuInputView(prepared.gpu_input_tensor, "GpuPreprocessor");
+                prepared.has_device_input_tensor = true;
+                prepared.d2h_copy_ms = 0.0;
+                EDGE_LOG_INFO("[Preprocess] full_gpu_pipeline=true, skip preprocess D2H copy"
+                              << ", input_shape="
+                              << ShapeToString(prepared.device_input_tensor.shape));
+            } else {
                 PROFILE_RANGE("d2h_copy");
                 if (!gpu_preprocessor_->CopyToHost(
-                        gpu_tensor,
+                        prepared.gpu_input_tensor,
                         stream.Get(),
                         prepared.input_tensor,
                         &prepared.d2h_copy_ms,
@@ -1084,7 +1175,7 @@ bool Pipeline::PostprocessPreparedBatch(
         bool postprocess_ok = false;
         if (infer_output != nullptr &&
             infer_output->has_device_tensor &&
-            infer_output->device_tensor.IsGpuFloat()) {
+            infer_output->device_tensor.IsGpu()) {
             postprocess_ok = trt_postprocess_engine_->RunDevice(infer_output->device_tensor,
                                                                 prepared.frame_metas,
                                                                 prepared.preprocess_metas,

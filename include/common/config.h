@@ -38,6 +38,7 @@ struct InferConfig {
 struct CudaConfig {
     int stream_pool_size = 1;
     bool enable_pinned_memory = false;
+    bool enable_full_gpu_pipeline = false;
 };
 
 struct PaddleConfig {
@@ -86,6 +87,7 @@ struct PostprocessConfig {
     float score_threshold = 0.25F;
     float nms_threshold = 0.45F;
     int top_k = 100;
+    float plugin_int8_input_scale = 1.0F;
 };
 
 struct ProfileConfig {

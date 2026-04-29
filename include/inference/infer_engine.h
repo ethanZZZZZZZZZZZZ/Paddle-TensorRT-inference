@@ -21,6 +21,11 @@ public:
         output.has_host_tensor = true;
         return true;
     }
+    virtual bool Infer(const DeviceTensorView& input, InferOutput& output) {
+        (void)input;
+        (void)output;
+        return false;
+    }
     virtual std::string Name() const = 0;
 };
 

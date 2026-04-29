@@ -198,6 +198,14 @@ bool PaddleInferEngine::Infer(const TensorBuffer& input, InferOutput& output) {
     return ExportOutput(output);
 }
 
+bool PaddleInferEngine::Infer(const DeviceTensorView& input, InferOutput& output) {
+    output = InferOutput{};
+    if (!RunPredictor(input)) {
+        return false;
+    }
+    return ExportOutput(output);
+}
+
 bool PaddleInferEngine::RunPredictor(const TensorBuffer& input) {
     if (!predictor_) {
         EDGE_LOG_ERROR("PaddleInferEngine must be initialized before Infer()");
@@ -223,6 +231,34 @@ bool PaddleInferEngine::RunPredictor(const TensorBuffer& input) {
                        << ". If the traceback mentions ReshapeOp capacity mismatch, "
                        << "the model likely has a fixed batch dimension; use batch_size=1 "
                        << "or re-export the model with dynamic batch support.");
+        return false;
+    }
+}
+
+bool PaddleInferEngine::RunPredictor(const DeviceTensorView& input) {
+    if (!predictor_) {
+        EDGE_LOG_ERROR("PaddleInferEngine must be initialized before Infer()");
+        return false;
+    }
+
+    try {
+        if (!BindDeviceInput(input)) {
+            return false;
+        }
+        if (!predictor_->Run()) {
+            EDGE_LOG_ERROR("Paddle predictor Run() failed for GPU input. input_shape="
+                           << ShapeToString(input.shape)
+                           << ". If the model was exported with fixed batch=1, "
+                           << "set infer.batch_size: 1 and infer.enable_dynamic_batch: false.");
+            return false;
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        EDGE_LOG_ERROR("PaddleInferEngine exception during GPU-input inference. input_shape="
+                       << ShapeToString(input.shape)
+                       << ", message=" << ex.what()
+                       << ". If this fails inside Paddle GPU input binding, disable "
+                       << "cuda.enable_full_gpu_pipeline and fall back to CopyFromCpu().");
         return false;
     }
 }
@@ -407,6 +443,45 @@ bool PaddleInferEngine::CopyInput(const TensorBuffer& input) {
     return true;
 }
 
+bool PaddleInferEngine::BindDeviceInput(const DeviceTensorView& input) {
+#ifdef EDGE_ENABLE_PADDLE_GPU_INPUT_SHARE
+    if (input_names_.empty()) {
+        EDGE_LOG_ERROR("PaddleInferEngine has no cached input tensor names");
+        return false;
+    }
+    if (!input.IsGpuFloat()) {
+        EDGE_LOG_ERROR("PaddleInferEngine GPU input path requires a GPU FP32 tensor view, got shape="
+                       << ShapeToString(input.shape)
+                       << ", num_elements=" << input.num_elements);
+        return false;
+    }
+
+    const auto input_shape = ToPaddleShape(input.shape);
+    auto input_handle = predictor_->GetInputHandle(input_names_.front());
+    auto* input_data = const_cast<float*>(static_cast<const float*>(input.data));
+    input_handle->ShareExternalData<float>(
+        input_data,
+        input_shape,
+        paddle_infer::PlaceType::kGPU);
+
+    EDGE_LOG_INFO("PaddleInferEngine shared GPU input name="
+                  << input_names_.front()
+                  << ", shape=" << ShapeToString(input.shape)
+                  << ", producer=" << input.producer
+                  << ". The caller must keep the GPU buffer alive until predictor->Run() completes.");
+    if (input_names_.size() > 1) {
+        EDGE_LOG_WARN("PaddleInferEngine currently binds only the first input tensor; extra inputs are ignored");
+    }
+    return true;
+#else
+    (void)input;
+    EDGE_LOG_ERROR("PaddleInferEngine GPU input ShareExternalData path was disabled at build time. "
+                   << "Reconfigure with -DENABLE_PADDLE_GPU_INPUT_SHARE=ON or disable "
+                   << "cuda.enable_full_gpu_pipeline.");
+    return false;
+#endif
+}
+
 bool PaddleInferEngine::CopyOutput(TensorBuffer& output) {
     if (output_names_.empty()) {
         EDGE_LOG_ERROR("PaddleInferEngine has no cached output tensor names");
@@ -443,29 +518,46 @@ bool PaddleInferEngine::ExportOutput(InferOutput& output) {
     const size_t output_elements = NumElements(output_shape);
     const auto tensor_shape = ToTensorShape(output_shape);
 
-    if (output_handle->type() != paddle_infer::DataType::FLOAT32) {
-        EDGE_LOG_ERROR("PaddleInferEngine device output view currently supports FLOAT32 only. "
-                       << "Use the host CopyToCpu path or extend the TensorRT plugin for this output type.");
-        return false;
-    }
-
     paddle_infer::PlaceType place = paddle_infer::PlaceType::kUNK;
     int raw_size = 0;
-    const float* data = output_handle->data<float>(&place, &raw_size);
+    const void* data = nullptr;
+    TensorDataType dtype = TensorDataType::kUnknown;
+    size_t element_bytes = 0;
+    const auto output_type = output_handle->type();
+    if (output_type == paddle_infer::DataType::FLOAT32) {
+        data = output_handle->data<float>(&place, &raw_size);
+        dtype = TensorDataType::kFloat32;
+        element_bytes = sizeof(float);
+    } else if (output_type == paddle_infer::DataType::FLOAT16) {
+        data = output_handle->data<uint16_t>(&place, &raw_size);
+        dtype = TensorDataType::kFloat16;
+        element_bytes = sizeof(uint16_t);
+    } else if (output_type == paddle_infer::DataType::INT8) {
+        data = output_handle->data<int8_t>(&place, &raw_size);
+        dtype = TensorDataType::kInt8;
+        element_bytes = sizeof(int8_t);
+    } else {
+        EDGE_LOG_ERROR("PaddleInferEngine output dtype is not supported by the current pipeline. "
+                       << "Supported device-output dtypes: FLOAT32, FLOAT16, INT8.");
+        return false;
+    }
 
     if (data != nullptr && place == paddle_infer::PlaceType::kGPU && output_elements > 0) {
         output.device_tensor.data = data;
         output.device_tensor.shape = tensor_shape;
         output.device_tensor.num_elements = output_elements;
+        output.device_tensor.element_bytes = element_bytes;
         output.device_tensor.place = TensorMemoryPlace::kGPU;
+        output.device_tensor.dtype = dtype;
         output.device_tensor.producer = output_names_.front();
         output.has_device_tensor = true;
         EDGE_LOG_INFO("PaddleInferEngine exported GPU output view name="
                       << output_names_.front()
                       << ", shape=" << ShapeToString(tensor_shape)
+                      << ", element_bytes=" << element_bytes
                       << ", raw_size_bytes=" << raw_size
                       << ". The pointer is valid until the next predictor run.");
-    } else {
+    } else if (output_type == paddle_infer::DataType::FLOAT32) {
         output.host_tensor.shape = tensor_shape;
         output.host_tensor.ClearExternalHostData();
         output.host_tensor.host_data.resize(output_elements);
@@ -476,6 +568,10 @@ bool PaddleInferEngine::ExportOutput(InferOutput& output) {
         EDGE_LOG_WARN("PaddleInferEngine output is not a GPU tensor view; copied output to host. "
                       << "place_is_gpu=" << (place == paddle_infer::PlaceType::kGPU ? "true" : "false")
                       << ", shape=" << ShapeToString(tensor_shape));
+    } else {
+        EDGE_LOG_ERROR("PaddleInferEngine received non-FP32 output outside GPU memory. "
+                       << "Host fallback is only implemented for FLOAT32 output tensors.");
+        return false;
     }
 
     if (output_names_.size() > 1) {

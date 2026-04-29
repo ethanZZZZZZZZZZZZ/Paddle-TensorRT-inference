@@ -58,15 +58,16 @@ private:
     template <typename T>
     using TrtUniquePtr = std::unique_ptr<T, TrtDeleter<T>>;
 
-    bool BuildForShape(const std::vector<int64_t>& model_shape);
-    bool IsBuiltForShape(const std::vector<int64_t>& model_shape) const;
+    bool BuildForShape(const std::vector<int64_t>& model_shape, TensorDataType model_dtype);
+    bool IsBuiltForShape(const std::vector<int64_t>& model_shape, TensorDataType model_dtype) const;
     bool AllocateDeviceBuffers(
         const std::vector<int64_t>& model_shape,
+        TensorDataType model_dtype,
         int batch,
         const std::vector<PreprocessMeta>& preprocess_metas,
         bool allocate_model_output,
         std::vector<float>* host_meta,
-        float** device_model_output,
+        void** device_model_output,
         float** device_meta,
         float** device_detections,
         int** device_counts) const;
@@ -74,7 +75,7 @@ private:
         int batch,
         const std::vector<FrameMeta>& frame_metas,
         cudaStream_t stream,
-        const float* device_model_output,
+        const void* device_model_output,
         float* device_meta,
         float* device_detections,
         int* device_counts,
@@ -92,6 +93,7 @@ private:
     int input_height_ = 0;
     bool use_pinned_memory_ = false;
     std::vector<int64_t> built_model_shape_;
+    TensorDataType built_model_dtype_ = TensorDataType::kUnknown;
 
     TrtUniquePtr<nvinfer1::IRuntime> runtime_;
     TrtUniquePtr<nvinfer1::ICudaEngine> engine_;

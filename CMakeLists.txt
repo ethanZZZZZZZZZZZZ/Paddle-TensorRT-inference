@@ -15,6 +15,7 @@ option(ENABLE_NVTX "Enable NVTX ranges for Nsight Systems profiling" OFF)
 option(ENABLE_PADDLE "Enable Paddle Inference backend" OFF)
 option(ENABLE_CUDA "Enable CUDA GPU preprocessing module" OFF)
 option(ENABLE_TENSORRT_PLUGIN "Build TensorRT YOLO decode + NMS plugin shared library" OFF)
+option(ENABLE_PADDLE_GPU_INPUT_SHARE "Enable Paddle Tensor::ShareExternalData GPU input binding path" ON)
 set(PADDLE_INFERENCE_DIR "" CACHE PATH "Root directory of a Paddle Inference C++ installation")
 set(PADDLE_INFERENCE_INCLUDE_DIR "" CACHE PATH "Directory containing paddle_inference_api.h")
 set(PADDLE_INFERENCE_LIB_DIR "" CACHE PATH "Directory containing libpaddle_inference")
@@ -532,6 +533,12 @@ if(ENABLE_PADDLE)
         PUBLIC
             EDGE_ENABLE_PADDLE=1
     )
+    if(ENABLE_PADDLE_GPU_INPUT_SHARE)
+        target_compile_definitions(edge_infer_core
+            PUBLIC
+                EDGE_ENABLE_PADDLE_GPU_INPUT_SHARE=1
+        )
+    endif()
     target_include_directories(edge_infer_core
         SYSTEM PUBLIC
             ${PADDLE_INFERENCE_INCLUDE_DIR}

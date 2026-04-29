@@ -77,15 +77,29 @@ enum class TensorMemoryPlace {
     kGPU
 };
 
+enum class TensorDataType {
+    kUnknown,
+    kFloat32,
+    kFloat16,
+    kInt8,
+    kInt32
+};
+
 struct DeviceTensorView {
-    const float* data = nullptr;
+    const void* data = nullptr;
     std::vector<int64_t> shape;
     size_t num_elements = 0;
+    size_t element_bytes = sizeof(float);
     TensorMemoryPlace place = TensorMemoryPlace::kUnknown;
+    TensorDataType dtype = TensorDataType::kFloat32;
     std::string producer;
 
-    bool IsGpuFloat() const {
+    bool IsGpu() const {
         return data != nullptr && place == TensorMemoryPlace::kGPU && num_elements > 0;
+    }
+
+    bool IsGpuFloat() const {
+        return IsGpu() && dtype == TensorDataType::kFloat32 && element_bytes == sizeof(float);
     }
 };
 

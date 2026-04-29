@@ -14,7 +14,7 @@ The plugin is isolated behind:
 ```
 
 In the pipeline it can run after Paddle/Paddle-TRT inference as a separate
-TensorRT postprocess engine. When Paddle exposes the model output as a GPU FP32
+TensorRT postprocess engine. When Paddle exposes the model output as a GPU
 view, that pointer is passed directly to the plugin engine; otherwise the
 pipeline uses the host fallback path.
 
@@ -23,7 +23,7 @@ pipeline uses the host fallback path.
 Inputs:
 
 ```text
-input[0] model_output     FP32, linear
+input[0] model_output     FP32 / FP16 / INT8, linear
 input[1] preprocess_meta FP32, linear, shape [B, 7]
 ```
 
@@ -67,24 +67,31 @@ nms_threshold   float
 top_k           int
 input_width     int
 input_height    int
+int8_input_scale float
 ```
 
 ## Supported Types
 
-- `model_output`: FP32 only
+- `model_output`: FP32, FP16, or INT8
 - `preprocess_meta`: FP32 only
 - `detections`: FP32 only
 - `detection_count`: INT32 only
 - Tensor format: linear only
 
+FP16 and INT8 inputs are converted to FP32 inside the decode kernel before
+score filtering and NMS. `int8_input_scale` is used only for INT8 input and must
+match the producer's quantization scale when a direct TensorRT INT8 engine feeds
+the plugin. The standalone postprocess engine also uses this scale to set the
+INT8 input dynamic range.
+
 ## Current Limits
 
 - This is a post-Paddle TensorRT plugin engine, not a plugin inserted into
   Paddle Inference's internal TensorRT subgraph.
-- Paddle output zero-copy requires a GPU FP32 Paddle output tensor view.
+- Paddle output zero-copy requires a GPU Paddle output tensor view. Host
+  fallback is currently implemented only for FP32 tensors.
 - NMS uses a simple greedy per-batch CUDA baseline; it is correct-oriented, not
   a highly optimized bitmask NMS.
-- FP16/INT8 plugin execution is not implemented yet.
 - The `[B, channels, boxes]` decoder assumes `cx, cy, w, h + class scores`.
   Confirm this against the exported model before using it as a production
   decoder.

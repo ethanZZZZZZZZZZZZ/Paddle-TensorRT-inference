@@ -46,8 +46,66 @@ cudaError_t LaunchDecodePreNMSFloatMetaKernel(
     int* candidate_counts,
     cudaStream_t stream);
 
+cudaError_t LaunchDecodePreNMSHalfMetaKernel(
+    const void* model_output,
+    int batch,
+    int boxes,
+    int values_per_box,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream);
+
+cudaError_t LaunchDecodePreNMSInt8MetaKernel(
+    const void* model_output,
+    float input_scale,
+    int batch,
+    int boxes,
+    int values_per_box,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream);
+
 cudaError_t LaunchDecodePreNMSBcnFloatMetaKernel(
     const float* model_output,
+    int batch,
+    int channels,
+    int boxes,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream);
+
+cudaError_t LaunchDecodePreNMSBcnHalfMetaKernel(
+    const void* model_output,
+    int batch,
+    int channels,
+    int boxes,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream);
+
+cudaError_t LaunchDecodePreNMSBcnInt8MetaKernel(
+    const void* model_output,
+    float input_scale,
     int batch,
     int channels,
     int boxes,

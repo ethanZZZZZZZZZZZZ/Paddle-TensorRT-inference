@@ -1,0 +1,93 @@
+# Full-GPU Paddle-TRT INT8 example with TensorRT plugin postprocess.
+# This assumes INT8 TensorRT cache/calibration artifacts already exist.
+# For calibration mode, start from configs/paddle_trt_int8_calib.yaml first.
+
+input:
+  source_type: video_file
+  path: "rtsp://10.193.210.153:8554/stream1"
+  num_streams: 1
+  num_frames: 0
+  synthetic_width: 1920
+  synthetic_height: 1080
+  synthetic_channels: 3
+
+model:
+  input_width: 640
+  input_height: 640
+  num_classes: 6
+  mock_num_boxes: 8400
+
+preprocess:
+  type: gpu
+
+infer:
+  backend: paddle_trt
+  precision: int8
+  batch_size: 1
+  enable_dynamic_batch: false
+  dynamic_batch_timeout_ms: 10
+  predictor_pool_size: 1
+
+cuda:
+  stream_pool_size: 2
+  enable_pinned_memory: true
+  enable_full_gpu_pipeline: true
+
+paddle:
+  model_file: "../models/inference.pdmodel"
+  params_file: "../models/inference.pdiparams"
+  model_dir: ""
+  use_gpu: true
+  gpu_mem_mb: 1024
+  gpu_device_id: 0
+  enable_ir_optim: true
+  enable_memory_optim: true
+
+trt:
+  enable: true
+  workspace_size: 1073741824
+  max_batch_size: 1
+  min_subgraph_size: 5
+  precision: int8
+  use_static: true
+  use_calib_mode: false
+  cache_dir: "../trt_cache/int8"
+  int8_calib_images: "../data/calibration_images.txt"
+  calib_batch_size: 1
+  calib_num_batches: 100
+  calib_cache_dir: "../trt_cache/int8_calib"
+  enable_dynamic_shape: true
+  dynamic_shape_input_name: "x2paddle_images"
+  min_input_shape: "1,3,640,640"
+  opt_input_shape: "1,3,640,640"
+  max_input_shape: "1,3,640,640"
+  disable_plugin_fp16: true
+
+trt_analysis:
+  enable: true
+  log_path: "../logs/paddle_trt_int8_full_gpu_plugin.log"
+  report_json: "../benchmarks/trt_subgraph_report_int8_full_gpu_plugin.json"
+  report_md: "../benchmarks/trt_subgraph_report_int8_full_gpu_plugin.md"
+
+postprocess:
+  mode: trt_yolo
+  decode_backend: trt_plugin
+  nms_backend: trt_plugin
+  score_threshold: 0.25
+  nms_threshold: 0.45
+  top_k: 100
+  # Only used if a direct TensorRT producer feeds INT8 tensors into the postprocess plugin.
+  # Paddle output is usually exported as FP32 by the current PaddleInferEngine path.
+  plugin_int8_input_scale: 1.0
+
+profile:
+  enable_timer: true
+
+output:
+  save_result: false
+  result_path: "../outputs/paddle_trt_int8_full_gpu_plugin.txt"
+
+benchmark:
+  warmup_iters: 20
+  benchmark_iters: 200
+  output_csv: "../benchmarks/paddle_trt_int8_full_gpu_plugin.csv"

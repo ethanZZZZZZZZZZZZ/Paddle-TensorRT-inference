@@ -200,7 +200,10 @@ void PredictorPool::WorkerLoop(Worker* worker) {
         }
 
         const auto infer_start = std::chrono::steady_clock::now();
-        if (task.request.prefer_device_output) {
+        if (task.request.has_device_input) {
+            result.used_infer_output = true;
+            result.ok = worker->engine->Infer(task.request.device_input, result.infer_output);
+        } else if (task.request.prefer_device_output) {
             result.ok = worker->engine->Infer(task.request.input, result.infer_output);
         } else {
             result.ok = worker->engine->Infer(task.request.input, result.host_output);

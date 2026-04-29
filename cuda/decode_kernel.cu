@@ -2,6 +2,9 @@
 
 #if defined(EDGE_ENABLE_CUDA) || defined(EDGE_ENABLE_TENSORRT_PLUGIN)
 
+#include <cstdint>
+
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace edge {
@@ -22,6 +25,23 @@ __device__ void SortBoxCorners(float* x1, float* y1, float* x2, float* y2) {
         *y1 = *y2;
         *y2 = tmp;
     }
+}
+
+template <typename T>
+__device__ float ReadModelValue(const T* data, int index, float input_scale) {
+    (void)input_scale;
+    return static_cast<float>(data[index]);
+}
+
+template <>
+__device__ float ReadModelValue<__half>(const __half* data, int index, float input_scale) {
+    (void)input_scale;
+    return __half2float(data[index]);
+}
+
+template <>
+__device__ float ReadModelValue<int8_t>(const int8_t* data, int index, float input_scale) {
+    return static_cast<float>(data[index]) * input_scale;
 }
 
 __global__ void DecodePreNMSKernel(
@@ -85,8 +105,10 @@ __global__ void DecodePreNMSKernel(
     candidates[candidate_index].batch_index = batch_index;
 }
 
-__global__ void DecodePreNMSFloatMetaKernel(
-    const float* model_output,
+template <typename T>
+__global__ void DecodePreNMSFloatMetaTypedKernel(
+    const T* model_output,
+    float input_scale,
     int batch,
     int boxes,
     int values_per_box,
@@ -109,7 +131,7 @@ __global__ void DecodePreNMSFloatMetaKernel(
     const int batch_index = linear_index / boxes;
     const int box_index = linear_index % boxes;
     const int base = (batch_index * boxes + box_index) * values_per_box;
-    const float score = model_output[base + 4];
+    const float score = ReadModelValue(model_output, base + 4, input_scale);
     if (score < score_threshold) {
         return;
     }
@@ -129,10 +151,10 @@ __global__ void DecodePreNMSFloatMetaKernel(
     const float max_x = fmaxf(original_width - 1.0F, 0.0F);
     const float max_y = fmaxf(original_height - 1.0F, 0.0F);
 
-    float x1 = (model_output[base + 0] - pad_x) / scale;
-    float y1 = (model_output[base + 1] - pad_y) / scale;
-    float x2 = (model_output[base + 2] - pad_x) / scale;
-    float y2 = (model_output[base + 3] - pad_y) / scale;
+    float x1 = (ReadModelValue(model_output, base + 0, input_scale) - pad_x) / scale;
+    float y1 = (ReadModelValue(model_output, base + 1, input_scale) - pad_y) / scale;
+    float x2 = (ReadModelValue(model_output, base + 2, input_scale) - pad_x) / scale;
+    float y2 = (ReadModelValue(model_output, base + 3, input_scale) - pad_y) / scale;
 
     x1 = ClampFloat(x1, 0.0F, max_x);
     y1 = ClampFloat(y1, 0.0F, max_y);
@@ -146,12 +168,14 @@ __global__ void DecodePreNMSFloatMetaKernel(
     candidates[candidate_base + 2] = x2;
     candidates[candidate_base + 3] = y2;
     candidates[candidate_base + 4] = score;
-    candidates[candidate_base + 5] = roundf(model_output[base + 5]);
+    candidates[candidate_base + 5] = roundf(ReadModelValue(model_output, base + 5, input_scale));
     candidates[candidate_base + 6] = static_cast<float>(batch_index);
 }
 
-__global__ void DecodePreNMSBcnFloatMetaKernel(
-    const float* model_output,
+template <typename T>
+__global__ void DecodePreNMSBcnFloatMetaTypedKernel(
+    const T* model_output,
+    float input_scale,
     int batch,
     int channels,
     int boxes,
@@ -175,10 +199,10 @@ __global__ void DecodePreNMSBcnFloatMetaKernel(
     const int box_index = linear_index % boxes;
     const int tensor_base = batch_index * channels * boxes;
 
-    float best_score = model_output[tensor_base + 4 * boxes + box_index];
+    float best_score = ReadModelValue(model_output, tensor_base + 4 * boxes + box_index, input_scale);
     int best_class = 0;
     for (int c = 5; c < channels; ++c) {
-        const float score = model_output[tensor_base + c * boxes + box_index];
+        const float score = ReadModelValue(model_output, tensor_base + c * boxes + box_index, input_scale);
         if (score > best_score) {
             best_score = score;
             best_class = c - 4;
@@ -203,10 +227,10 @@ __global__ void DecodePreNMSBcnFloatMetaKernel(
     const float max_x = fmaxf(original_width - 1.0F, 0.0F);
     const float max_y = fmaxf(original_height - 1.0F, 0.0F);
 
-    const float cx = model_output[tensor_base + box_index];
-    const float cy = model_output[tensor_base + boxes + box_index];
-    const float w = model_output[tensor_base + 2 * boxes + box_index];
-    const float h = model_output[tensor_base + 3 * boxes + box_index];
+    const float cx = ReadModelValue(model_output, tensor_base + box_index, input_scale);
+    const float cy = ReadModelValue(model_output, tensor_base + boxes + box_index, input_scale);
+    const float w = ReadModelValue(model_output, tensor_base + 2 * boxes + box_index, input_scale);
+    const float h = ReadModelValue(model_output, tensor_base + 3 * boxes + box_index, input_scale);
 
     float x1 = (cx - 0.5F * w - pad_x) / scale;
     float y1 = (cy - 0.5F * h - pad_y) / scale;
@@ -288,8 +312,80 @@ cudaError_t LaunchDecodePreNMSFloatMetaKernel(
     constexpr int threads = 256;
     const int total_boxes = batch * boxes;
     const int blocks = (total_boxes + threads - 1) / threads;
-    DecodePreNMSFloatMetaKernel<<<blocks, threads, 0, stream>>>(
+    DecodePreNMSFloatMetaTypedKernel<float><<<blocks, threads, 0, stream>>>(
         model_output,
+        1.0F,
+        batch,
+        boxes,
+        values_per_box,
+        preprocess_metas,
+        score_threshold,
+        top_k,
+        input_width,
+        input_height,
+        candidates,
+        candidate_counts);
+
+    const int count_blocks = (batch + threads - 1) / threads;
+    CapCandidateCountsKernel<<<count_blocks, threads, 0, stream>>>(candidate_counts, batch, top_k);
+    return cudaGetLastError();
+}
+
+cudaError_t LaunchDecodePreNMSHalfMetaKernel(
+    const void* model_output,
+    int batch,
+    int boxes,
+    int values_per_box,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int total_boxes = batch * boxes;
+    const int blocks = (total_boxes + threads - 1) / threads;
+    DecodePreNMSFloatMetaTypedKernel<__half><<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(model_output),
+        1.0F,
+        batch,
+        boxes,
+        values_per_box,
+        preprocess_metas,
+        score_threshold,
+        top_k,
+        input_width,
+        input_height,
+        candidates,
+        candidate_counts);
+
+    const int count_blocks = (batch + threads - 1) / threads;
+    CapCandidateCountsKernel<<<count_blocks, threads, 0, stream>>>(candidate_counts, batch, top_k);
+    return cudaGetLastError();
+}
+
+cudaError_t LaunchDecodePreNMSInt8MetaKernel(
+    const void* model_output,
+    float input_scale,
+    int batch,
+    int boxes,
+    int values_per_box,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int total_boxes = batch * boxes;
+    const int blocks = (total_boxes + threads - 1) / threads;
+    DecodePreNMSFloatMetaTypedKernel<int8_t><<<blocks, threads, 0, stream>>>(
+        static_cast<const int8_t*>(model_output),
+        input_scale,
         batch,
         boxes,
         values_per_box,
@@ -322,8 +418,80 @@ cudaError_t LaunchDecodePreNMSBcnFloatMetaKernel(
     constexpr int threads = 256;
     const int total_boxes = batch * boxes;
     const int blocks = (total_boxes + threads - 1) / threads;
-    DecodePreNMSBcnFloatMetaKernel<<<blocks, threads, 0, stream>>>(
+    DecodePreNMSBcnFloatMetaTypedKernel<float><<<blocks, threads, 0, stream>>>(
         model_output,
+        1.0F,
+        batch,
+        channels,
+        boxes,
+        preprocess_metas,
+        score_threshold,
+        top_k,
+        input_width,
+        input_height,
+        candidates,
+        candidate_counts);
+
+    const int count_blocks = (batch + threads - 1) / threads;
+    CapCandidateCountsKernel<<<count_blocks, threads, 0, stream>>>(candidate_counts, batch, top_k);
+    return cudaGetLastError();
+}
+
+cudaError_t LaunchDecodePreNMSBcnHalfMetaKernel(
+    const void* model_output,
+    int batch,
+    int channels,
+    int boxes,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int total_boxes = batch * boxes;
+    const int blocks = (total_boxes + threads - 1) / threads;
+    DecodePreNMSBcnFloatMetaTypedKernel<__half><<<blocks, threads, 0, stream>>>(
+        static_cast<const __half*>(model_output),
+        1.0F,
+        batch,
+        channels,
+        boxes,
+        preprocess_metas,
+        score_threshold,
+        top_k,
+        input_width,
+        input_height,
+        candidates,
+        candidate_counts);
+
+    const int count_blocks = (batch + threads - 1) / threads;
+    CapCandidateCountsKernel<<<count_blocks, threads, 0, stream>>>(candidate_counts, batch, top_k);
+    return cudaGetLastError();
+}
+
+cudaError_t LaunchDecodePreNMSBcnInt8MetaKernel(
+    const void* model_output,
+    float input_scale,
+    int batch,
+    int channels,
+    int boxes,
+    const float* preprocess_metas,
+    float score_threshold,
+    int top_k,
+    int input_width,
+    int input_height,
+    float* candidates,
+    int* candidate_counts,
+    cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int total_boxes = batch * boxes;
+    const int blocks = (total_boxes + threads - 1) / threads;
+    DecodePreNMSBcnFloatMetaTypedKernel<int8_t><<<blocks, threads, 0, stream>>>(
+        static_cast<const int8_t*>(model_output),
+        input_scale,
         batch,
         channels,
         boxes,

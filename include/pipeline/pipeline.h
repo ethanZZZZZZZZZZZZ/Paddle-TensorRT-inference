@@ -37,6 +37,11 @@ private:
     struct PreparedBatch {
         FrameBatch batch;
         TensorBuffer input_tensor;
+#ifdef EDGE_ENABLE_CUDA
+        GpuTensorBuffer gpu_input_tensor;
+        DeviceTensorView device_input_tensor;
+        bool has_device_input_tensor = false;
+#endif
         std::vector<PreprocessMeta> preprocess_metas;
         std::vector<FrameMeta> frame_metas;
         std::chrono::steady_clock::time_point process_start_time;

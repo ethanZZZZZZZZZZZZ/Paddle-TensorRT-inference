@@ -359,7 +359,7 @@ const char *YoloDecodePlugin::getPluginNamespace() const noexcept {
   return namespace_.c_str();
 }
 
-#if !defined(NV_TENSORRT_MAJOR) || NV_TENSORRT_MAJOR < 10
+#if !defined(NV_TENSORRT_MAJOR) || NV_TENSORRT_MAJOR < 8
 bool YoloDecodePlugin::isOutputBroadcastAcrossBatch(
     int output_index, const bool *input_is_broadcasted,
     int nb_inputs) const noexcept {
@@ -374,7 +374,9 @@ bool YoloDecodePlugin::canBroadcastInputAcrossBatch(
   (void)input_index;
   return false;
 }
+#endif
 
+#if !defined(NV_TENSORRT_MAJOR) || NV_TENSORRT_MAJOR < 10
 void YoloDecodePlugin::attachToContext(
     cudnnContext *cudnn_context, cublasContext *cublas_context,
     nvinfer1::IGpuAllocator *gpu_allocator) noexcept {

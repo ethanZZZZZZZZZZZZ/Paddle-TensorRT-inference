@@ -1,0 +1,58 @@
+# Mock predictor pool smoke config.
+# This exercises batch-level multi-threaded inference without Paddle/CUDA/TRT.
+
+input:
+  source_type: synthetic
+  path: "synthetic://mock"
+  num_streams: 4
+  num_frames: 8
+  synthetic_width: 640
+  synthetic_height: 360
+  synthetic_channels: 3
+
+model:
+  input_width: 640
+  input_height: 640
+  num_classes: 3
+  mock_num_boxes: 3
+
+preprocess:
+  type: cpu
+
+infer:
+  backend: mock
+  precision: fp32
+  batch_size: 4
+  enable_dynamic_batch: true
+  dynamic_batch_timeout_ms: 10
+  predictor_pool_size: 2
+
+trt:
+  enable: false
+  workspace_size: 1073741824
+  max_batch_size: 4
+  min_subgraph_size: 3
+  precision: fp32
+  use_static: false
+  use_calib_mode: false
+  cache_dir: "../trt_cache"
+
+postprocess:
+  mode: mock_yolo
+  decode_backend: cpu
+  nms_backend: cpu
+  score_threshold: 0.25
+  nms_threshold: 0.45
+  top_k: 100
+
+profile:
+  enable_timer: true
+
+output:
+  save_result: false
+  result_path: "outputs/mock_predictor_pool_result.txt"
+
+benchmark:
+  warmup_iters: 2
+  benchmark_iters: 6
+  output_csv: "../benchmarks/mock_predictor_pool.csv"

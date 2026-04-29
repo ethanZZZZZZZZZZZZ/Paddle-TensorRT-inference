@@ -1,0 +1,69 @@
+# Paddle Inference backend example.
+# Paths are placeholders for user local exported inference model files.
+
+input:
+  source_type: synthetic
+  path: "synthetic://mock"
+  # Start Paddle backend with one stream and batch=1 unless the exported model
+  # is confirmed to support dynamic batch.
+  num_streams: 1
+  num_frames: 3
+  synthetic_width: 640
+  synthetic_height: 360
+  synthetic_channels: 3
+
+model:
+  input_width: 640
+  input_height: 640
+  num_classes: 3
+  mock_num_boxes: 3
+
+preprocess:
+  type: cpu
+
+infer:
+  backend: paddle
+  precision: fp32
+  batch_size: 1
+  enable_dynamic_batch: false
+  dynamic_batch_timeout_ms: 10
+
+paddle:
+  model_file: "../models/inference.pdmodel"
+  params_file: "../models/inference.pdiparams"
+  model_dir: ""
+  use_gpu: false
+  gpu_mem_mb: 512
+  gpu_device_id: 0
+  enable_ir_optim: true
+  enable_memory_optim: true
+
+trt:
+  enable: false
+  workspace_size: 1073741824
+  max_batch_size: 1
+  min_subgraph_size: 3
+  precision: fp32
+  use_static: false
+  use_calib_mode: false
+  cache_dir: "../trt_cache"
+
+postprocess:
+  mode: raw
+  decode_backend: cpu
+  nms_backend: cpu
+  score_threshold: 0.25
+  nms_threshold: 0.45
+  top_k: 100
+
+profile:
+  enable_timer: true
+
+output:
+  save_result: false
+  result_path: "../outputs/paddle_result.txt"
+
+benchmark:
+  warmup_iters: 0
+  benchmark_iters: 3
+  output_csv: "../benchmarks/results.csv"

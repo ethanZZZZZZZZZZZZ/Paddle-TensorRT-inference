@@ -1,0 +1,80 @@
+# Paddle-TRT FP16 predictor pool example.
+# Use this only after a single-predictor Paddle-TRT config is confirmed locally.
+
+input:
+  source_type: synthetic
+  path: "synthetic://mock"
+  num_streams: 2
+  num_frames: 20
+  synthetic_width: 640
+  synthetic_height: 360
+  synthetic_channels: 3
+
+model:
+  input_width: 640
+  input_height: 640
+  num_classes: 6
+  mock_num_boxes: 8400
+
+preprocess:
+  type: cpu
+
+infer:
+  backend: paddle_trt
+  precision: fp16
+  batch_size: 1
+  enable_dynamic_batch: false
+  dynamic_batch_timeout_ms: 10
+  predictor_pool_size: 2
+
+paddle:
+  model_file: "../models/inference.pdmodel"
+  params_file: "../models/inference.pdiparams"
+  model_dir: ""
+  use_gpu: true
+  gpu_mem_mb: 1024
+  gpu_device_id: 0
+  enable_ir_optim: true
+  enable_memory_optim: true
+
+trt:
+  enable: true
+  workspace_size: 1073741824
+  max_batch_size: 1
+  min_subgraph_size: 5
+  precision: fp16
+  use_static: true
+  use_calib_mode: false
+  cache_dir: "../trt_cache/fp16_predictor_pool"
+  enable_dynamic_shape: true
+  dynamic_shape_input_name: "x2paddle_images"
+  min_input_shape: "1,3,640,640"
+  opt_input_shape: "1,3,640,640"
+  max_input_shape: "1,3,640,640"
+  disable_plugin_fp16: true
+
+trt_analysis:
+  enable: true
+  log_path: "../logs/paddle_trt_fp16_predictor_pool.log"
+  report_json: "../benchmarks/trt_subgraph_report_fp16_predictor_pool.json"
+  report_md: "../benchmarks/trt_subgraph_report_fp16_predictor_pool.md"
+
+postprocess:
+  mode: raw
+  decode_backend: cpu
+  nms_backend: cpu
+  score_threshold: 0.25
+  nms_threshold: 0.45
+  top_k: 100
+
+profile:
+  enable_timer: true
+
+output:
+  save_result: false
+  result_path: "../outputs/paddle_trt_fp16_predictor_pool.txt"
+
+benchmark:
+  warmup_iters: 20
+  benchmark_iters: 200
+  output_csv: "../benchmarks/paddle_trt_fp16_predictor_pool.csv"
